@@ -5,6 +5,7 @@ render_mode shadows_disabled;
 #define FRESNEL
 #define PLAYER_WAVES
 #define DISPLACEMENT
+#define SSR
 
 group_uniforms color;
 uniform vec3 absorption_color : source_color = vec3(1.0, 0.35, 0.0);
@@ -44,9 +45,18 @@ uniform float player_wave_speed : hint_range(0.0, 10.0, 0.1) = 5.0;
 
 #ifdef CAUSTICS
 group_uniforms caustics;
-uniform float caustic_size : hint_range(0.0, 6.0, 0.01) = 2.0;
+uniform float caustic_size : hint_range(0.0, 8.0, 0.01) = 2.0;
 uniform float caustic_range : hint_range(0.0, 256.0, 0.1) = 40.0;
 uniform float caustic_strength : hint_range(0.0, 1.0, 0.01) = 0.08;
+#endif
+
+#ifdef SSR
+group_uniforms screen_space_reflections;
+uniform float ssr_mix_strength : hint_range(0.0, 1.0, 0.01) = 0.65;
+uniform float ssr_travel : hint_range(0.0, 300.0, 0.5) = 100.0;
+uniform float ssr_resolution_near : hint_range(0.1, 10.0, 0.1) = 1.0;
+uniform float ssr_resolution_far : hint_range(2.0, 20.0, 0.1) = 5.0;
+uniform float ssr_tolerance : hint_range(0.0, 2.0, 0.01) = 1.0;
 #endif
 
 group_uniforms normal_map;
@@ -64,8 +74,8 @@ global uniform vec3 wind_direction;
 #ifdef PLAYER_WAVES
 global uniform vec3 player_position;
 #endif
-uniform sampler2D screen_texture: hint_screen_texture, filter_linear_mipmap, repeat_enable;
-uniform sampler2D depth_texture: hint_depth_texture, filter_linear_mipmap;
+uniform sampler2D screen_texture: hint_screen_texture, filter_linear_mipmap, repeat_disable;
+uniform sampler2D depth_texture: hint_depth_texture, filter_linear_mipmap, repeat_disable;
 
 varying vec3 global_position;
 
@@ -153,10 +163,31 @@ float fresnel(vec3 normal, vec3 view) {
 #endif
 
 
-vec2 refract_uv(vec2 uv, vec3 normal, float depth){
+vec2 refract_uv(inout vec2 uv, vec3 normal, float depth){
 	float strength1 = refraction_strength * depth;
 	uv += fma(strength1, length(normal), strength1 * -1.2);
 	return uv;
+}
+
+#ifdef SSR
+vec2 get_uv_from_view_position(vec3 position_view_space, mat4 proj_m)
+{
+	vec4 position_clip_space = proj_m * vec4(position_view_space.xyz, 1.0);
+	vec2 position_ndc = position_clip_space.xy / position_clip_space.w;
+	return position_ndc.xy * 0.5 + 0.5;
+}
+
+vec3 get_view_position_from_uv(vec2 uv, float depth, mat4 inv_proj_m)
+{
+	vec4 position_ndc = vec4((uv * 2.0) - 1.0, depth, 1.0);
+	vec4 view_position = inv_proj_m * position_ndc;
+	return view_position.xyz /= view_position.w;
+}
+#endif
+
+bool in_bounds(vec2 uv) {
+	vec2 fruv = abs(floor(uv));
+	return fruv.x + fruv.y < 0.1;
 }
 
 
@@ -184,8 +215,8 @@ void fragment() {
 	#endif
 
 	float time_factor = TIME * scroll_speed * wind_intens_factor;
-	vec3 n1 = texture(normal_map, fma(global_position.xz, normal_map_scale, time_factor * -normalized_wind_direction.xz)).xyz;
-	vec3 n2 = texture(normal_map, fma(global_position.xz, normal_map_scale * scale_offset, time_factor * 0.8 * (-normalized_wind_direction.xz + scroll_offset))).xyz;
+	vec3 n1 = textureLod(normal_map, fma(global_position.xz, normal_map_scale, time_factor * -normalized_wind_direction.xz), 2.0).xyz;
+	vec3 n2 = textureLod(normal_map, fma(global_position.xz, normal_map_scale * scale_offset, time_factor * 0.8 * (-normalized_wind_direction.xz + scroll_offset)), 2.0).xyz;
 	NORMAL_MAP = mix(n1, n2, 0.5);
 	NORMAL_MAP_DEPTH = normal_map_strength;
 
@@ -194,22 +225,10 @@ void fragment() {
 
 	vec3 ndc = vec3(fma(SCREEN_UV, vec2(2.0), vec2(-1.0)), depth_tex);
 	vec4 world = INV_VIEW_MATRIX * INV_PROJECTION_MATRIX * vec4(ndc, 1.0);
-	float depth_texture_y = world.y / world.w;
+	world.y /= world.w;
 	float vertey_y = (INV_VIEW_MATRIX * vec4(VERTEX, 1.0)).y;
-	float relative_depth = vertey_y - depth_texture_y;
+	float relative_depth = vertey_y - world.y;
 
-	// Caustic Effects
-	#ifdef CAUSTICS
-	float range_mod = clamp((VERTEX.z + caustic_range) * 0.05, 0.0, 1.0);
-	float caustic_value = 0.0;
-	// Protect yourself from calculating Noise at runtime with this handy if statement!
-	if (range_mod > 0.0) {
-		vec3 X = vec3((global_position * caustic_size ).xz, mod(TIME, 578.0) * 0.8660254037844386);
-		vec4 noiseResult = os2NoiseWithDerivatives_Fallback(X);
-		noiseResult = os2NoiseWithDerivatives_Fallback(X - noiseResult.xyz / 16.0);
-		caustic_value = fma(noiseResult.w, 0.5, 0.5) * range_mod * range_mod;
-	}
-	#endif
 
 	// Create Edge caused by other Objects
 	float edge_blend = clamp(relative_depth / -edge_thickness + 1.0, 0.0, 1.0);
@@ -237,25 +256,37 @@ void fragment() {
 	clip_pos.xyz /= clip_pos.w;
 	DEPTH = clip_pos.z;
 	// Refract UV
-	vec2 refracted_uv = refract_uv(SCREEN_UV, NORMAL_MAP, sqrt(DEPTH));
+	vec2 refracted_uv = SCREEN_UV;
+	refract_uv(refracted_uv, NORMAL_MAP, sqrt(DEPTH) * relative_depth);
 
 	vec3 screen;
 	float depth_blend;
 	float refracted_depth_tex = textureLod(depth_texture, refracted_uv, lod).x;
-	ndc.z = refracted_depth_tex;
+	ndc = vec3(fma(refracted_uv, vec2(2.0), vec2(-1.0)), refracted_depth_tex);
 	world = INV_VIEW_MATRIX * INV_PROJECTION_MATRIX * vec4(ndc, 1.0);
-	float refracted_depth_texture_y = world.y / world.w;
-	float depth_test = vertey_y - refracted_depth_texture_y;
+	world.xyz /= world.w;
+	float depth_test = vertey_y - world.y;
+
+	// Caustic Effects
+	#ifdef CAUSTICS
+	float range_mod = clamp((VERTEX.z + caustic_range) * 0.05, 0.0, 1.0);
+	float caustic_value = 0.0;
+	// Protect yourself from calculating Noise at runtime with this handy if statement!
+	if (range_mod > 0.0) {
+		vec3 X = vec3(world.xz * caustic_size, mod(TIME, 578.0) * 0.8660254037844386);
+		vec4 noiseResult = os2NoiseWithDerivatives_Fallback(X);
+		noiseResult = os2NoiseWithDerivatives_Fallback(X - noiseResult.xyz / 16.0);
+		caustic_value = fma(noiseResult.w, 0.5, 0.5) * range_mod * range_mod;
+	}
+	#endif
 
 	/*
 	Sometimes the Water Refraction would cause the sampling of a screen position that is either
 	outside the screen bounds or where another object is infront of the water.
 	Switching back to the unrefracted SCREEN_UV fixes that.
 	*/
-	vec2 fruv = abs(floor(refracted_uv));
-	bool out_of_bounds = fruv.x + fruv.y < 0.001;
 
-	if (depth_test > 0.0 && out_of_bounds) {
+	if (depth_test > -0.0001 && in_bounds(refracted_uv)) {
 		screen = textureLod(screen_texture, refracted_uv, lod).rgb * 0.9;
 		depth_blend = clamp(depth_test / depth_distance, 0.0, 1.0);
 		depth_blend = fma(exp(-depth_blend * beers_law), -1.0, 1.0);
@@ -265,6 +296,35 @@ void fragment() {
 		depth_blend = fma(exp(-depth_blend * beers_law), -1.0, 1.0);
 	}
 
+	#ifdef SSR
+	vec3 view_normal_map = mat3(VIEW_MATRIX) * (vec3(NORMAL_MAP.x, 0.0, NORMAL_MAP.y) * 2.0 - 1.0);
+	vec3 combined_normal = normalize(view_normal_map * (NORMAL_MAP_DEPTH * 0.15) + NORMAL);
+	vec3 reflacted_path = reflect(-VIEW, combined_normal);
+
+	vec2 current_screen_pos = vec2(0.0);
+	vec3 current_view_pos = VERTEX;
+	vec3 sampled_color = vec3(-1.0);
+	float current_stepD = 0.0;
+	float current_depth = 0.0;
+	float alpha_hit = 0.0;
+	for(float i = 0.01; i < ssr_travel; i++) {
+		current_stepD = mix(ssr_resolution_near, ssr_resolution_far,float(i) / float(ssr_travel));
+		current_view_pos += reflacted_path * current_stepD;
+		current_screen_pos = get_uv_from_view_position(current_view_pos, PROJECTION_MATRIX);
+		if (!in_bounds(current_screen_pos)) {break;}
+		current_depth = get_view_position_from_uv(current_screen_pos, texture(depth_texture, current_screen_pos).x, INV_PROJECTION_MATRIX).z - current_view_pos.z;
+
+		if (current_depth > -0.0001 && current_depth <= ssr_tolerance * current_stepD) {
+			sampled_color = textureLod(screen_texture, current_screen_pos, 0.5).rgb;
+			vec2 ruv = 1.0 - abs(current_screen_pos * 2.0 - 1.0);
+			ruv = pow(ruv, vec2(0.5));
+			alpha_hit = clamp(min(ruv.x, ruv.y), 0.0, 1.0);
+			break;
+		}
+		i += current_stepD;
+	}
+	#endif
+
 	vec3 color = clamp(screen - absorption_color.rgb * depth_blend, vec3(0.0), vec3(1.0)); // Absorb Screen Color
 	color = mix(color, opposing_color, depth_blend*depth_blend); // Apply depth color
 	#ifdef FRESNEL
@@ -272,6 +332,9 @@ void fragment() {
 	#endif
 	#ifdef CAUSTICS
 	color = clamp( color + caustic_value * caustic_strength, vec3(0.0), vec3(1.0));
+	#endif
+	#ifdef SSR
+	color = mix(color, sampled_color, alpha_hit * (1.0 - roughness) * ssr_mix_strength);
 	#endif
 	color = mix(color, vec3(0.98), ripple_mask); // Apply Ripples
 	ALBEDO = color;
