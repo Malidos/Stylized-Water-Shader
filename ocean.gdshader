@@ -220,8 +220,7 @@ void fragment() {
 	NORMAL_MAP = mix(n1, n2, 0.5);
 	NORMAL_MAP_DEPTH = normal_map_strength;
 
-	float lod = textureQueryLod(screen_texture, SCREEN_UV).y;
-	float depth_tex = textureLod(depth_texture, SCREEN_UV, lod).r;
+	float depth_tex = texture(depth_texture, SCREEN_UV).r;
 
 	vec3 ndc = vec3(fma(SCREEN_UV, vec2(2.0), vec2(-1.0)), depth_tex);
 	vec4 world = INV_VIEW_MATRIX * INV_PROJECTION_MATRIX * vec4(ndc, 1.0);
@@ -261,7 +260,7 @@ void fragment() {
 
 	vec3 screen;
 	float depth_blend;
-	float refracted_depth_tex = textureLod(depth_texture, refracted_uv, lod).x;
+	float refracted_depth_tex = texture(depth_texture, refracted_uv).x;
 	ndc = vec3(fma(refracted_uv, vec2(2.0), vec2(-1.0)), refracted_depth_tex);
 	world = INV_VIEW_MATRIX * INV_PROJECTION_MATRIX * vec4(ndc, 1.0);
 	world.xyz /= world.w;
@@ -287,11 +286,11 @@ void fragment() {
 	*/
 
 	if (depth_test > -0.0001 && in_bounds(refracted_uv)) {
-		screen = textureLod(screen_texture, refracted_uv, lod).rgb * 0.9;
+		screen = texture(screen_texture, refracted_uv).rgb * 0.9;
 		depth_blend = clamp(depth_test / depth_distance, 0.0, 1.0);
 		depth_blend = fma(exp(-depth_blend * beers_law), -1.0, 1.0);
 	} else {
-		screen = textureLod(screen_texture, SCREEN_UV, lod).rgb * 0.9;
+		screen = texture(screen_texture, SCREEN_UV).rgb * 0.9;
 		depth_blend = clamp(relative_depth / depth_distance, 0.0, 1.0);
 		depth_blend = fma(exp(-depth_blend * beers_law), -1.0, 1.0);
 	}
@@ -331,7 +330,7 @@ void fragment() {
 	color = mix(color, fresnel_color, fresnel_value); // Apply fresnel color
 	#endif
 	#ifdef CAUSTICS
-	color = clamp( color + caustic_value * caustic_strength, vec3(0.0), vec3(1.0));
+	color = clamp(color + caustic_value * caustic_strength * (1.0 - depth_blend), vec3(0.0), vec3(1.0));
 	#endif
 	#ifdef SSR
 	color = mix(color, sampled_color, alpha_hit * (1.0 - roughness) * ssr_mix_strength);
